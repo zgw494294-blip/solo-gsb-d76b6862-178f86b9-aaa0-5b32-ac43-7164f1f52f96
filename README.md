@@ -788,6 +788,11 @@ curl -s -i -X POST http://localhost:8080/api/compose \
   `/api/compose` 仍接受任意 JSON 常量，该限制仅用于预演。
 * 相等按 **JSON 类型和值**判断：数字按数值比较，**`1` 与 `1.0` 相等**；布尔不与数字相等
   （`true != 1`）；字符串 `"1"` 不等于数字 `1`；大小写敏感。
+* **整数按原数值精确比较，不设整数范围限制**：超过 `2**53` 的相邻整数不会被误判相等
+  （JSON 整数 `9007199254740992` 与 `9007199254740993` 互不匹配），整数与浮点混合时仍按
+  数值判定（`9007199254740993` 与浮点 `9007199254740992.0` 不相等，而可被浮点精确表示的
+  整数与其浮点值相等）；超过有限浮点范围的巨大整数（如 401 位的 `10**400` 十进制 JSON 整数）
+  同样可以作键、作条件值，不会溢出报错。
 * 筛选条件中 **`null` 匹配 `null`**；内连接的 **`null` 键不匹配任何键**（包括另一侧的 `null`）。
 
 ### 执行与行序
@@ -869,6 +874,73 @@ curl -s -i -X POST http://localhost:8080/api/preview \
 #      "row_reasons":[{"node_id":"s","column":"id_card"}]}]}}}
 # 错误体中没有 columns/rows —— 不泄露任何样本数据。
 ```
+
+### 大整数连接键示例（按原数值精确比较，不溢出）
+
+连接键与筛选常量中的整数始终按**原数值**比较，不改变请求中的 JSON 类型、也不另设整数范围：
+超过 `2**53` 的两个相邻整数不会因浮点舍入而误匹配——下例左右两侧各一行、键分别为
+`9007199254740992` 与 `9007199254740993`，返回 200 且 `rows` 为空：
+
+```bash
+curl -s -X POST http://localhost:8080/api/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "nodes": [
+    {"id": "l", "type": "source",
+     "columns": [{"name": "k"}, {"name": "v"}]},
+    {"id": "r", "type": "source",
+     "columns": [{"name": "k"}, {"name": "w"}]},
+    {"id": "j", "type": "join",
+     "left_input": "l", "right_input": "r",
+     "left_key": "k", "right_key": "k",
+     "outputs": [
+       {"alias": "k", "side": "left", "column": "k"},
+       {"alias": "v", "side": "left", "column": "v"},
+       {"alias": "w", "side": "right", "column": "w"}]}
+  ],
+  "export": "j",
+  "rows": {
+    "l": [{"k": 9007199254740992, "v": "a"}],
+    "r": [{"k": 9007199254740993, "w": "b"}]
+  }
+}'
+# {"export":"j","columns":["k","v","w"],"rows":[],"review":{... "blocked":false ...}}
+```
+
+超过有限浮点范围的巨大整数同样可用：两侧键都是 401 位十进制 JSON 整数 `10**400` 时
+（Python 字面量写作 `10 ** 400`），返回 200 且得到一条匹配，键在响应中仍是同一个整数
+（不会变浮点、也不会再报 500/`INTERNAL`）；而该整数与相邻整数或任意有限浮点键都不匹配：
+
+```bash
+BIG=$(python3 -c 'print(10 ** 400)')   # 401 位十进制整数
+curl -s -X POST http://localhost:8080/api/preview \
+  -H 'Content-Type: application/json' \
+  -d "{
+  \"nodes\": [
+    {\"id\": \"l\", \"type\": \"source\",
+     \"columns\": [{\"name\": \"k\"}, {\"name\": \"v\"}]},
+    {\"id\": \"r\", \"type\": \"source\",
+     \"columns\": [{\"name\": \"k\"}, {\"name\": \"w\"}]},
+    {\"id\": \"j\", \"type\": \"join\",
+     \"left_input\": \"l\", \"right_input\": \"r\",
+     \"left_key\": \"k\", \"right_key\": \"k\",
+     \"outputs\": [
+       {\"alias\": \"k\", \"side\": \"left\", \"column\": \"k\"},
+       {\"alias\": \"v\", \"side\": \"left\", \"column\": \"v\"},
+       {\"alias\": \"w\", \"side\": \"right\", \"column\": \"w\"}]}
+  ],
+  \"export\": \"j\",
+  \"rows\": {
+    \"l\": [{\"k\": $BIG, \"v\": \"a\"}],
+    \"r\": [{\"k\": $BIG, \"w\": \"b\"}]
+  }
+}"
+# rows 恰好一条：[<同一个 401 位整数>, "a", "b"]
+```
+
+整数与浮点混合时按数值判定：`1` 与 `1.0` 仍相等（保留全部组合），但整数
+`9007199254740993` 与浮点 `9007199254740992.0` 不相等；布尔与数字隔离、字符串按类型比较、
+`null` 键不匹配、重复键全部组合及左行再右行的行序等既有规则均不变。
 
 其他整次拒绝（HTTP 400，不返回部分数据）：`rows`/`conditions` 覆盖不符
 （`PREVIEW_SOURCE_COVERAGE` / `PREVIEW_FILTER_COVERAGE`）、行键不全

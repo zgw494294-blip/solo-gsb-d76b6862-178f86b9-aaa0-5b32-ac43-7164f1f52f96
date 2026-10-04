@@ -1273,9 +1273,10 @@ def _is_scalar(value: object) -> bool:
 def _scalar_equal(left: object, right: object) -> bool:
     """JSON-type-and-value equality.
 
-    Numbers compare numerically (``1`` equals ``1.0``), booleans never equal
-    numbers (``True`` is not ``1``), and values of different JSON kinds never
-    match. ``None`` equals ``None``.
+    Numbers compare by their exact numeric value (``1`` equals ``1.0``, and
+    integers beyond ``2**53`` still compare at full precision — no float
+    coercion), booleans never equal numbers (``True`` is not ``1``), and
+    values of different JSON kinds never match. ``None`` equals ``None``.
     """
     if left is None or right is None:
         return left is None and right is None
@@ -1290,13 +1291,22 @@ def _scalar_equal(left: object, right: object) -> bool:
 
 
 def _join_key(value: object) -> tuple[bool, object] | None:
-    """Hashable key for the inner join; ``None`` keys never match."""
+    """Hashable key for the inner join; ``None`` keys never match.
+
+    Numbers keep their original int/float value rather than being coerced to
+    float: Python compares ints with floats by exact numeric value (``1``
+    matches ``1.0`` but the integer 9007199254740993 does not match the float
+    9007199254740992.0), integers of arbitrary size stay hashable, and equal
+    int/float pairs share a hash so a dict keeps matching them. Coercing to
+    float would instead collapse consecutive integers beyond ``2**53`` into
+    one key and raise ``OverflowError`` on the largest JSON integers.
+    """
     if value is None:
         return None
     if isinstance(value, bool):
         return (True, value)
     if isinstance(value, (int, float)):
-        return (False, float(value))
+        return (False, value)
     if isinstance(value, str):
         return (False, value)
     return None  # non-scalar values are rejected before materialization
@@ -1340,9 +1350,13 @@ def preview(request: PreviewRequest) -> dict[str, object]:
     is materialized topologically (shared branches computed once, never
     mutated): projections copy or substitute constants, filters pass all
     columns through, joins are inner equi-joins (null keys never match,
-    duplicate keys keep every combination). Every source and intermediate
-    relation must stay within :data:`PREVIEW_ROW_LIMIT` rows; any overflow or
-    malformed input rejects the whole request without partial data.
+    duplicate keys keep every combination). Join keys and filter constants
+    compare numbers at their exact value, so integers of any size (including
+    integers beyond ``2**53`` or the finite-float range) match only themselves
+    and exact numeric float equals (``1`` still matches ``1.0``). Every source
+    and intermediate relation must stay within :data:`PREVIEW_ROW_LIMIT` rows;
+    any overflow or malformed input rejects the whole request without partial
+    data.
     """
     by_id, order, relations = _evaluate_graph(request)
 

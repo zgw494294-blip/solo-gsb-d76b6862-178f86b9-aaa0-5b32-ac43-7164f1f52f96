@@ -201,6 +201,119 @@ def test_preview_join_no_match_returns_empty():
     assert res["rows"] == []
 
 
+def _big_int_join_payload(left_rows, right_rows):
+    """Two non-sensitive sources joined on k; outputs k, v, w."""
+    return {
+        "nodes": [
+            {"id": "l", "type": "source",
+             "columns": [{"name": "k"}, {"name": "v"}]},
+            {"id": "r", "type": "source",
+             "columns": [{"name": "k"}, {"name": "w"}]},
+            {"id": "j", "type": "join",
+             "left_input": "l", "right_input": "r",
+             "left_key": "k", "right_key": "k",
+             "outputs": [
+                 {"alias": "k", "side": "left", "column": "k"},
+                 {"alias": "v", "side": "left", "column": "v"},
+                 {"alias": "w", "side": "right", "column": "w"},
+             ]},
+        ],
+        "export": "j",
+        "rows": {"l": left_rows, "r": right_rows},
+    }
+
+
+def test_preview_join_consecutive_integers_above_2p53_do_not_match():
+    # float coercion used to collapse both keys into the same value, wrongly
+    # returning the left row; exact integer comparison must keep them apart.
+    payload = _big_int_join_payload(
+        [{"k": 9007199254740992, "v": "a"}],
+        [{"k": 9007199254740993, "w": "b"}],
+    )
+    res = call(payload)
+    assert res["rows"] == []
+
+    # The large integer still matches itself.
+    payload = _big_int_join_payload(
+        [{"k": 9007199254740993, "v": "a"}],
+        [{"k": 9007199254740993, "w": "b"}],
+    )
+    res = call(payload)
+    assert res["rows"] == [[9007199254740993, "a", "b"]]
+    assert isinstance(res["rows"][0][0], int)
+
+
+def test_preview_join_int_and_float_compare_by_exact_value():
+    # Exactly representable integers still equal their float value ...
+    payload = _big_int_join_payload(
+        [{"k": 9007199254740992, "v": "a"}],
+        [{"k": 9007199254740992.0, "w": "b"}],
+    )
+    assert call(payload)["rows"] == [[9007199254740992, "a", "b"]]
+
+    # ... but the integer 2**53+1 is not equal to the float 2**53 (which the
+    # float key must round-trip to), in either join direction.
+    payload = _big_int_join_payload(
+        [{"k": 9007199254740993, "v": "a"}],
+        [{"k": 9007199254740992.0, "w": "b"}],
+    )
+    assert call(payload)["rows"] == []
+    payload = _big_int_join_payload(
+        [{"k": 9007199254740992.0, "v": "a"}],
+        [{"k": 9007199254740993, "w": "b"}],
+    )
+    assert call(payload)["rows"] == []
+
+
+def test_preview_join_huge_integer_keys_match_without_overflow():
+    # 10**400 lies far beyond the finite-float range; converting either key to
+    # float used to raise OverflowError (HTTP 500). Both sides carry the same
+    # decimal JSON integer, so the join must return the single combination.
+    big = 10 ** 400
+    payload = _big_int_join_payload(
+        [{"k": big, "v": "a"}],
+        [{"k": big, "w": "b"}],
+    )
+    res = call(payload)
+    assert len(res["rows"]) == 1
+    assert res["rows"][0] == [big, "a", "b"]
+    assert isinstance(res["rows"][0][0], int)
+
+    # A huge integer key never matches a finite float or a neighboring integer.
+    payload = _big_int_join_payload(
+        [{"k": big, "v": "a"}],
+        [{"k": 1.0, "w": "x"}, {"k": big + 1, "w": "y"}],
+    )
+    assert call(payload)["rows"] == []
+
+
+def test_preview_join_huge_integer_duplicate_keys_keep_combinations_and_order():
+    big = 10 ** 400
+    payload = _big_int_join_payload(
+        [{"k": big, "v": "a"}, {"k": big, "v": "b"}],
+        [{"k": big, "w": "x"}, {"k": big, "w": "y"}],
+    )
+    assert call(payload)["rows"] == [
+        [big, "a", "x"], [big, "a", "y"],
+        [big, "b", "x"], [big, "b", "y"],
+    ]
+
+
+def test_preview_filter_compares_huge_integers_exactly():
+    nodes = [
+        {"id": "s", "type": "source", "columns": [{"name": "k"}]},
+        {"id": "f", "type": "filter", "input": "s", "references": ["k"]},
+    ]
+    big = 10 ** 400
+    rows = {"s": [{"k": big}, {"k": big + 1}, {"k": 1}, {"k": 1.0}, {"k": True}]}
+    res = call({"nodes": nodes, "export": "f", "rows": rows,
+                "conditions": {"f": {"k": big}}})
+    assert res["rows"] == [[big]]
+    res = call({"nodes": nodes, "export": "f", "rows": rows,
+                "conditions": {"f": {"k": 1}}})
+    assert res["rows"] == [[1], [1.0]]
+
+
 def test_preview_self_join_is_supported_with_one_rows_entry():
     payload = {
         "nodes": [
@@ -606,6 +719,72 @@ def test_http_preview_from_example_file():
         [1, "a@x.example", "ALL"],
         [3, None, "ALL"],
     ]
+
+
+def test_http_preview_large_integer_keys_compare_exactly():
+    # The two distinct integers beyond 2**53 must not be conflated by float
+    # coercion: the response is 200 with an empty rows array.
+    payload = {
+        "nodes": [
+            {"id": "l", "type": "source",
+             "columns": [{"name": "k"}, {"name": "v"}]},
+            {"id": "r", "type": "source",
+             "columns": [{"name": "k"}, {"name": "w"}]},
+            {"id": "j", "type": "join",
+             "left_input": "l", "right_input": "r",
+             "left_key": "k", "right_key": "k",
+             "outputs": [
+                 {"alias": "k", "side": "left", "column": "k"},
+                 {"alias": "v", "side": "left", "column": "v"},
+                 {"alias": "w", "side": "right", "column": "w"},
+             ]},
+        ],
+        "export": "j",
+        "rows": {
+            "l": [{"k": 9007199254740992, "v": "a"}],
+            "r": [{"k": 9007199254740993, "w": "b"}],
+        },
+    }
+    resp = client.post("/api/preview", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["rows"] == []
+
+
+def test_http_preview_huge_integer_key_match_roundtrips_decimal():
+    # A decimal JSON integer beyond the finite-float range must match on both
+    # sides instead of failing with 500/INTERNAL, and the joined key must come
+    # back verbatim as the same decimal JSON integer (no float serialization).
+    big = 10 ** 400
+    big_literal = str(big)
+    payload = {
+        "nodes": [
+            {"id": "l", "type": "source",
+             "columns": [{"name": "k"}, {"name": "v"}]},
+            {"id": "r", "type": "source",
+             "columns": [{"name": "k"}, {"name": "w"}]},
+            {"id": "j", "type": "join",
+             "left_input": "l", "right_input": "r",
+             "left_key": "k", "right_key": "k",
+             "outputs": [
+                 {"alias": "k", "side": "left", "column": "k"},
+                 {"alias": "v", "side": "left", "column": "v"},
+                 {"alias": "w", "side": "right", "column": "w"},
+             ]},
+        ],
+        "export": "j",
+        "rows": {
+            "l": [{"k": big, "v": "a"}],
+            "r": [{"k": big, "w": "b"}],
+        },
+    }
+    resp = client.post("/api/preview", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["rows"] == [[big, "a", "b"]]
+    # Raw JSON transport: the value stays an integer literal of full length.
+    assert big_literal in resp.text
+    assert (big_literal + ".0") not in resp.text
+    assert "1e+400" not in resp.text.replace(" ", "")
 
 
 def test_http_preview_blocked_returns_400_without_sample_data():
