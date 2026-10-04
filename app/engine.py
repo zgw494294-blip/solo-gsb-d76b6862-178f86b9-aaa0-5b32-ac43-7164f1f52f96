@@ -1275,7 +1275,8 @@ def _scalar_equal(left: object, right: object) -> bool:
 
     Numbers compare numerically (``1`` equals ``1.0``), booleans never equal
     numbers (``True`` is not ``1``), and values of different JSON kinds never
-    match. ``None`` equals ``None``.
+    match. ``None`` equals ``None``. Integers compare by their exact value at
+    any precision: ``9007199254740993`` does not equal ``9007199254740992.0``.
     """
     if left is None or right is None:
         return left is None and right is None
@@ -1296,7 +1297,12 @@ def _join_key(value: object) -> tuple[bool, object] | None:
     if isinstance(value, bool):
         return (True, value)
     if isinstance(value, (int, float)):
-        return (False, float(value))
+        # Keep the exact numeric value as the key. Python compares and hashes
+        # int/float by exact mathematical value, so ``1`` still matches
+        # ``1.0`` while ``9007199254740993`` does not match
+        # ``9007199254740992.0``; arbitrary-precision integers neither lose
+        # precision nor overflow (a ``float()`` conversion would do both).
+        return (False, value)
     if isinstance(value, str):
         return (False, value)
     return None  # non-scalar values are rejected before materialization

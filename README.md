@@ -788,6 +788,10 @@ curl -s -i -X POST http://localhost:8080/api/compose \
   `/api/compose` 仍接受任意 JSON 常量，该限制仅用于预演。
 * 相等按 **JSON 类型和值**判断：数字按数值比较，**`1` 与 `1.0` 相等**；布尔不与数字相等
   （`true != 1`）；字符串 `"1"` 不等于数字 `1`；大小写敏感。
+* 整数按**原数值**精确比较，不改写请求值类型、不设额外整数范围限制、**不转浮点**：
+  `9007199254740993`（2^53+1）既不等于 `9007199254740992`，也不等于浮点
+  `9007199254740992.0`；`10**400` 这类超出浮点范围的十进制 JSON 整数可正常用作
+  连接键/条件值，既不丢失精度也不溢出。
 * 筛选条件中 **`null` 匹配 `null`**；内连接的 **`null` 键不匹配任何键**（包括另一侧的 `null`）。
 
 ### 执行与行序
@@ -840,6 +844,61 @@ curl -s -X POST http://localhost:8080/api/preview \
 
 示例中 uid 2 因 `country` 为 `"US"` 被筛掉，uid 4 的小写 `"cn"` 与条件 `"CN"` 严格不等同样
 被筛掉；uid 3 的 `email` 为 `null`，原样出现在结果里；常量列 `bucket` 每行填 `"ALL"`。
+
+### 大整数连接键调用（可直接执行）
+
+连接键为超出浮点精确范围的整数时仍按**原数值**比较。下例两侧各一行，键分别为 2^53 与
+2^53+1——数值不同，返回 200 与空 `rows`（若先转浮点二者会坍缩成同一个数而误判一行）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "nodes": [
+    {"id": "l", "type": "source", "columns": [{"name": "k"}]},
+    {"id": "r", "type": "source", "columns": [{"name": "k"}]},
+    {"id": "j", "type": "join",
+     "left_input": "l", "right_input": "r",
+     "left_key": "k", "right_key": "k",
+     "outputs": [{"alias": "lk", "side": "left", "column": "k"},
+                 {"alias": "rk", "side": "right", "column": "k"}]}
+  ],
+  "export": "j",
+  "rows": {"l": [{"k": 9007199254740992}], "r": [{"k": 9007199254740993}]}
+}'
+```
+
+```json
+{"export": "j", "columns": ["lk", "rk"], "rows": [],
+ "review": {"export": "j", "blocked": false, "columns": [
+   {"name": "lk", "blocked": false, "content_reasons": [], "row_reasons": []},
+   {"name": "rk", "blocked": false, "content_reasons": [], "row_reasons": []}]}}
+```
+
+超出浮点范围的超大整数同样精确匹配、不溢出。下例两侧键都是 `10**400`（1 后面 400 个 0
+的十进制 JSON 整数），返回 200 与一条匹配（请求体用 python3 生成，避免手抄 400 位数字）：
+
+```bash
+python3 - <<'EOF' | curl -s -X POST http://localhost:8080/api/preview \
+  -H 'Content-Type: application/json' --data @-
+import json
+big = 10**400
+print(json.dumps({
+  "nodes": [
+    {"id": "l", "type": "source", "columns": [{"name": "k"}]},
+    {"id": "r", "type": "source", "columns": [{"name": "k"}]},
+    {"id": "j", "type": "join",
+     "left_input": "l", "right_input": "r",
+     "left_key": "k", "right_key": "k",
+     "outputs": [{"alias": "lk", "side": "left", "column": "k"},
+                 {"alias": "rk", "side": "right", "column": "k"}]}
+  ],
+  "export": "j",
+  "rows": {"l": [{"k": big}], "r": [{"k": big}]}
+}))
+EOF
+# rows 为 [[10**400, 10**400]]（响应原样回显该 400 位整数）
+```
 
 ### 敏感筛选拒绝调用（阻断时只回审查原因）
 

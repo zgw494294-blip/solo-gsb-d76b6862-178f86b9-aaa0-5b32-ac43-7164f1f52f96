@@ -201,6 +201,93 @@ def test_preview_join_no_match_returns_empty():
     assert res["rows"] == []
 
 
+# ------------------------- big-integer join keys ---------------------------
+
+
+# Two non-sensitive one-row sources joined on k; outputs echo both keys.
+def _bigint_join_payload(left_k, right_k):
+    return {
+        "nodes": [
+            {"id": "l", "type": "source", "columns": [{"name": "k"}]},
+            {"id": "r", "type": "source", "columns": [{"name": "k"}]},
+            {"id": "j", "type": "join",
+             "left_input": "l", "right_input": "r",
+             "left_key": "k", "right_key": "k",
+             "outputs": [
+                 {"alias": "lk", "side": "left", "column": "k"},
+                 {"alias": "rk", "side": "right", "column": "k"},
+             ]},
+        ],
+        "export": "j",
+        "rows": {"l": [{"k": left_k}], "r": [{"k": right_k}]},
+    }
+
+
+def test_preview_join_keys_above_2_pow_53_compare_exactly():
+    # 2**53 and 2**53+1 collapse to the same float; they must not match.
+    res = call(_bigint_join_payload(9007199254740992, 9007199254740993))
+    assert res["rows"] == []
+    # The same big integer on both sides still matches.
+    res = call(_bigint_join_payload(9007199254740993, 9007199254740993))
+    assert res["rows"] == [[9007199254740993, 9007199254740993]]
+
+
+def test_preview_join_huge_integer_keys_match_without_overflow():
+    big = 10**400
+    # Far beyond the float range: exact match works, no overflow.
+    res = call(_bigint_join_payload(big, big))
+    assert res["rows"] == [[big, big]]
+    # A neighbour differing only in the last digit does not match.
+    res = call(_bigint_join_payload(big, big + 1))
+    assert res["rows"] == []
+
+
+def test_preview_join_mixed_int_float_keys_keep_json_numeric_semantics():
+    # int/float numeric equality is kept: 1 matches 1.0.
+    res = call(_bigint_join_payload(1, 1.0))
+    assert res["rows"] == [[1, 1.0]]
+    # ...but a big int never matches the float it would only round to.
+    res = call(_bigint_join_payload(9007199254740993, 9007199254740992.0))
+    assert res["rows"] == []
+    res = call(_bigint_join_payload(9007199254740992.0, 9007199254740993))
+    assert res["rows"] == []
+
+
+def test_preview_join_big_integer_duplicate_keys_keep_all_combinations():
+    big = 10**400
+    payload = _bigint_join_payload(big, big)
+    # Two left rows and two right rows sharing one huge key: all 4
+    # combinations, left rows outer, right rows inner.
+    payload["rows"] = {
+        "l": [{"k": big}, {"k": big}],
+        "r": [{"k": big}, {"k": big}],
+    }
+    res = call(payload)
+    assert res["rows"] == [[big, big]] * 4
+
+
+def test_preview_filter_big_integer_equality_is_exact():
+    nodes = [
+        {"id": "s", "type": "source", "columns": [{"name": "v"}]},
+        {"id": "f", "type": "filter", "input": "s", "references": ["v"]},
+    ]
+    big = 10**400
+    rows = {"s": [
+        {"v": 9007199254740992},
+        {"v": 9007199254740993},
+        {"v": 9007199254740992.0},
+        {"v": big},
+    ]}
+    # Only the exactly equal integer survives; the nearby int and the float
+    # it would round to do not.
+    res = call({"nodes": nodes, "export": "f", "rows": rows,
+                "conditions": {"f": {"v": 9007199254740993}}})
+    assert res["rows"] == [[9007199254740993]]
+    res = call({"nodes": nodes, "export": "f", "rows": rows,
+                "conditions": {"f": {"v": big}}})
+    assert res["rows"] == [[big]]
+
+
 def test_preview_self_join_is_supported_with_one_rows_entry():
     payload = {
         "nodes": [
@@ -606,6 +693,29 @@ def test_http_preview_from_example_file():
         [1, "a@x.example", "ALL"],
         [3, None, "ALL"],
     ]
+
+
+def test_http_preview_join_keys_above_2_pow_53_do_not_match():
+    # 2**53 vs 2**53+1: distinct JSON integers, so 200 with empty rows
+    # (a float conversion would wrongly return one row).
+    resp = client.post("/api/preview",
+                       json=_bigint_join_payload(9007199254740992,
+                                                 9007199254740993))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["columns"] == ["lk", "rk"]
+    assert body["rows"] == []
+    assert body["review"]["blocked"] is False
+
+
+def test_http_preview_huge_integer_join_keys_match_without_500():
+    # 10**400 as a decimal JSON integer on both sides: one exact match,
+    # no overflow to a 500/INTERNAL.
+    big = 10**400
+    resp = client.post("/api/preview", json=_bigint_join_payload(big, big))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["rows"] == [[big, big]]
 
 
 def test_http_preview_blocked_returns_400_without_sample_data():
